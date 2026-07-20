@@ -91,3 +91,23 @@ void simulateHotKey(HotkeySimImpl *self, uint keyCode, bool down, bool maskCmd, 
     CGEventPost(loc, event);
     CFRelease(event);
 }
+
+// Avalonia creates tray icons with NSSquareStatusItemLength, which clips wide images.
+// Switch our status items to variable length so icon+battery text can use a wider pill.
+void setTrayIconsUseVariableWidth(void) {
+    @autoreleasepool {
+        NSStatusBar *bar = [NSStatusBar systemStatusBar];
+        // Private KVC: items created by this process.
+        NSArray *items = [bar valueForKey:@"items"];
+        if (items == nil)
+            items = [bar valueForKey:@"_items"];
+        if (items == nil)
+            return;
+
+        for (NSStatusItem *item in items) {
+            if (![item isKindOfClass:[NSStatusItem class]])
+                continue;
+            [item setLength:NSVariableStatusItemLength];
+        }
+    }
+}

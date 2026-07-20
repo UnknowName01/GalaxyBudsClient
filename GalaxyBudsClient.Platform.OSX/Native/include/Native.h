@@ -60,6 +60,7 @@ extern void sendMagicMediaCmd(bool play);
 extern void setHideInDock(bool doHide);
 extern void setAutoStartEnabled(bool autoStart);
 extern bool isAutoStartEnabled();
+extern void setTrayIconsUseVariableWidth(void);
 
 extern void allocHotkeyMgr(HotkeyMgrImpl **self, HotkeyOnDispatch cb);
 extern bool registerHotKey(HotkeyMgrImpl *self, uint win32Keyflags, uint win32Modflags);

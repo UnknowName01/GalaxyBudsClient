@@ -120,6 +120,8 @@ public static class AppUtils
     [DllImport(DSO.Name)]
     public static extern bool isAutoStartEnabled();
     [DllImport(DSO.Name)]
+    public static extern void setTrayIconsUseVariableWidth();
+    [DllImport(DSO.Name)]
     public static extern unsafe void allocHotkeyMgr(void *self, HotkeyOnDispatch cb);
     [DllImport(DSO.Name)]
     public static extern unsafe bool registerHotKey(void *self, uint win32Keyflags, uint win32Modflags);
