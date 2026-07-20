@@ -18,16 +18,15 @@ namespace GalaxyBudsClient.Utils.Interface;
 
 public static class WindowIconRenderer
 {
-    private const double CanvasWidth = 560;
     private const double CanvasHeight = 256;
     private const double Padding = 6;
-    private const double Gap = 20;
+    private const double Gap = 14;
+    /// <summary>Extra scale for battery % after fitting into the text area.</summary>
+    private const double BatteryTextScaleBoost = 1.28;
     private const int AnimFrameCount = 12;
     private static readonly TimeSpan AnimFrameInterval = TimeSpan.FromMilliseconds(20);
 
     private static readonly Bitmap DefaultTrayBitmap = MakeDefaultBitmap();
-    // Same canvas as battery frames so the macOS status-item pill width never jumps mid-animation.
-    private static readonly WindowIcon DefaultIcon = MakeBatteryFrame(0, progress: 0);
 
     private static DispatcherTimer? _animTimer;
     private static int _animFrame;
@@ -68,7 +67,7 @@ public static class WindowIconRenderer
             {
                 // Already expanded (or expanding): refresh final layout without replaying.
                 if (_animTimer == null)
-                    SetTrayIcon(MakeBatteryFrame(clamped, 1));
+                    SetTrayIcon(MakeBatteryFrame(clamped, 1, compact: false));
                 return;
             }
 
@@ -83,7 +82,7 @@ public static class WindowIconRenderer
             if (!_showingBattery && _animDirection <= 0)
             {
                 StopAnimation();
-                SetTrayIcon(DefaultIcon);
+                SetTrayIcon(MakeBatteryFrame(0, 0, compact: true));
                 return;
             }
 
@@ -94,8 +93,13 @@ public static class WindowIconRenderer
     private static void StartAnimation(bool expand)
     {
         StopAnimation();
-        // Lock variable-width before the first wide frame so AppKit doesn't resize mid-tween.
         EnsureVariableTrayWidth();
+
+        // AppKit jitters if status-item width changes every frame. Keep a stable *wide*
+        // canvas for the whole tween; only snap to the compact bitmap when idle.
+        if (expand)
+            SetTrayIcon(MakeBatteryFrame(_targetLevel, 0, compact: false));
+
         _animFrame = expand ? 0 : AnimFrameCount;
         _animDirection = expand ? 1 : -1;
         _animTimer = new DispatcherTimer { Interval = AnimFrameInterval };
@@ -123,22 +127,21 @@ public static class WindowIconRenderer
         {
             StopAnimation();
             _showingBattery = true;
-            SetTrayIcon(MakeBatteryFrame(_targetLevel, 1));
         }
         else if (_animDirection < 0 && _animFrame <= 0)
         {
             StopAnimation();
             _showingBattery = false;
-            SetTrayIcon(DefaultIcon);
+            // One compact snap after the content finished centering — saves menu-bar space.
+            SetTrayIcon(MakeBatteryFrame(0, 0, compact: true));
         }
     }
 
     private static void ApplyAnimFrame()
     {
         var t = Math.Clamp(_animFrame / (double)AnimFrameCount, 0, 1);
-        // Smoothstep for a less linear slide/fade.
         var eased = t * t * (3 - 2 * t);
-        SetTrayIcon(MakeBatteryFrame(_targetLevel, eased));
+        SetTrayIcon(MakeBatteryFrame(_targetLevel, eased, compact: false));
     }
 
     private static void SetTrayIcon(WindowIcon icon)
@@ -172,23 +175,21 @@ public static class WindowIconRenderer
     private static void EnsureVariableTrayWidth() { }
 #endif
 
-    /// <param name="progress">0 = earbud centered, battery hidden; 1 = final layout.</param>
-    private static WindowIcon MakeBatteryFrame(int level, double progress)
+    /// <param name="progress">0 = earbud centered / % hidden; 1 = final earbud+% layout.</param>
+    /// <param name="compact">
+    /// When true (idle disconnected only), bitmap width is icon-sized so the pill stays narrow.
+    /// During animation always pass false so AppKit does not resize every frame.
+    /// </param>
+    private static WindowIcon MakeBatteryFrame(int level, double progress, bool compact)
     {
+        progress = Math.Clamp(progress, 0, 1);
         var contentHeight = CanvasHeight - Padding * 2;
 
         var src = DefaultTrayBitmap;
-        // Match default tray icon size (fill menu-bar height, not shrink into a side column).
-        var iconScale = contentHeight / src.Size.Height;
+        var iconScale = contentHeight / src.Size.Height * 0.9;
         var iconWidth = src.Size.Width * iconScale;
         var iconHeight = src.Size.Height * iconScale;
 
-        var startIconX = (CanvasWidth - iconWidth) / 2;
-        var finalIconX = Padding;
-        var iconX = startIconX + (finalIconX - startIconX) * progress;
-        var iconY = Padding + (contentHeight - iconHeight) / 2;
-
-        var textAreaWidth = Math.Max(0, CanvasWidth - Padding * 2 - iconWidth - Gap);
         var formattedText = new FormattedText(
             $"{level}%",
             CultureInfo.CurrentCulture,
@@ -199,12 +200,45 @@ public static class WindowIconRenderer
 
         var textGeometry = formattedText.BuildGeometry(new Point(0, 0))!;
         var textBounds = textGeometry.Bounds;
-        var textScale = textAreaWidth > 0
-            ? Math.Min(textAreaWidth / textBounds.Width, contentHeight / textBounds.Height)
-            : 0;
+
+        var maxTextAreaWidth = Math.Max(48, iconWidth * 1.35);
+        var textScale = 0.0;
+        if (textBounds.Width > 0 && textBounds.Height > 0)
+        {
+            var fitScale = Math.Min(maxTextAreaWidth / textBounds.Width, contentHeight / textBounds.Height);
+            textScale = fitScale * BatteryTextScaleBoost;
+            textScale = Math.Min(textScale, maxTextAreaWidth * 1.05 / textBounds.Width);
+            textScale = Math.Min(textScale, contentHeight * 1.15 / textBounds.Height);
+        }
+
         var scaledTextWidth = textBounds.Width * textScale;
         var scaledTextHeight = textBounds.Height * textScale;
-        var textOriginX = Padding + iconWidth + Gap + (textAreaWidth - scaledTextWidth) / 2;
+
+        var narrowWidth = Padding * 2 + iconWidth;
+        var wideWidth = Padding * 2 + iconWidth + Gap + scaledTextWidth;
+        // Stable wide canvas while animating; compact only when idle-disconnected.
+        var narrowPixelW = Math.Max(2, (int)Math.Round(narrowWidth / 2.0) * 2);
+        var widePixelW = Math.Max(2, (int)Math.Round(wideWidth / 2.0) * 2);
+        var pixelWidth = compact ? narrowPixelW : widePixelW;
+        var pixelHeight = (int)CanvasHeight;
+
+        // macOS menu-bar items grow/shrink leftward (right edge stays put). Keep the
+        // earbud locked to that right edge at progress=0 so the narrow↔wide snap
+        // does not jump the icon on screen — only the empty left side appears/disappears.
+        var compactIconX = (narrowPixelW - iconWidth) / 2;
+        var iconXFromRight = narrowPixelW - compactIconX - iconWidth;
+        var wideIconXAtProgress0 = widePixelW - iconWidth - iconXFromRight;
+        var finalIconX = Padding;
+
+        double iconX;
+        if (compact)
+            iconX = compactIconX;
+        else
+            iconX = wideIconXAtProgress0 + (finalIconX - wideIconXAtProgress0) * progress;
+
+        var iconY = Padding + (contentHeight - iconHeight) / 2;
+
+        var textOriginX = iconX + iconWidth + Gap;
         var textOriginY = Padding + (contentHeight - scaledTextHeight) / 2;
         var textMatrix = Matrix.CreateScale(textScale, textScale) *
                          Matrix.CreateTranslation(
@@ -212,7 +246,7 @@ public static class WindowIconRenderer
                              textOriginY - textBounds.Y * textScale);
 
         var render = new RenderTargetBitmap(
-            new PixelSize((int)CanvasWidth, (int)CanvasHeight), new Vector(96, 96));
+            new PixelSize(pixelWidth, pixelHeight), new Vector(96, 96));
         using (var ctx = render.CreateDrawingContext())
         {
             ctx.PushRenderOptions(new RenderOptions
@@ -225,7 +259,7 @@ public static class WindowIconRenderer
 
             ctx.DrawImage(src, new Rect(iconX, iconY, iconWidth, iconHeight));
 
-            if (progress > 0.01)
+            if (!compact && progress > 0.01 && textScale > 0)
             {
                 using (ctx.PushOpacity(progress))
                 using (ctx.PushTransform(textMatrix))
