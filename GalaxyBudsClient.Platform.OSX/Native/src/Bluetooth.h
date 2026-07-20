@@ -56,6 +56,8 @@ typedef void (*Bt_OnChannelClosed)(void);
 
 - (id)init;
 - (BT_CONN_RESULT)connect:(NSString *)mac uuid:(const UInt8 *)uuid;
+- (void)forceCloseRfcommChannel;
+- (void)requestBasebandBounceForNextConnect:(NSString *)mac;
 - (BT_ENUM_RESULT)enumerate:(EnumerationResult *)result;
 - (BOOL)disconnect;
 - (BOOL)isConnected;
@@ -70,6 +72,7 @@ typedef void (*Bt_OnChannelClosed)(void);
 
 // Implementation of delegate calls (see IOBluetoothRFCOMMChannel.h)
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)rfcommChannel data:(void *)dataPointer length:(size_t)dataLength;
+- (void)rfcommChannelOpenComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel status:(IOReturn)status;
 - (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)rfcommChannel;
 - (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status;
 @end

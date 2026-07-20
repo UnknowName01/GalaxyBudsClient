@@ -6,6 +6,19 @@
 #import <IOBluetooth/IOBluetooth.h>
 #import "Bluetooth.h"
 
+typedef void (^BtConnectFinish)(BT_CONN_RESULT result);
+
+@interface Bluetooth ()
+@property(nonatomic, copy) BtConnectFinish connectFinish;
+@property(nonatomic, copy) NSString *pendingMac;
+@property(nonatomic, strong) NSData *pendingUuid;
+@property(nonatomic, assign) NSInteger connectGeneration;
+@property(nonatomic, assign) BOOL continuedAfterSdp;
+/// After phone/other host used SPP, Mac often keeps a stale ACL that rejects RFCOMM.
+/// Set on RFCOMM failure so the next attempt opens a fresh baseband link.
+@property(nonatomic, assign) BOOL bounceBasebandBeforeNextConnect;
+@end
+
 @implementation Bluetooth {
     NSString *_macAddress;
     Bt_OnChannelData _onChannelData;
@@ -15,114 +28,248 @@
 - (id)init {
     if (self = [super init]) {
         _macAddress = NULL;
+        _connectGeneration = 0;
     }
 
     return self;
 }
 
+- (void)finishConnect:(BT_CONN_RESULT)result generation:(NSInteger)generation
+{
+    if (generation != self.connectGeneration) {
+        return;
+    }
+
+    BtConnectFinish finish = self.connectFinish;
+    self.connectFinish = nil;
+    self.pendingMac = nil;
+    self.pendingUuid = nil;
+
+    if (finish) {
+        finish(result);
+    }
+}
+
+// Never dispatch_sync onto the main queue: openRFCOMMChannelSync / openConnection can
+// block for a minute and freeze the UI, or deadlock with .NET waiting on main.
+// Instead: schedule work async on main (so Avalonia keeps pumping), wait on a semaphore.
 - (BT_CONN_RESULT)connect:(NSString *)mac uuid:(const UInt8 *)uuid {
+    __block BT_CONN_RESULT result = BT_CONN_EUNKNOWN;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    NSData *uuidData = [NSData dataWithBytes:uuid length:16];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self beginConnectOnMain:mac uuid:uuidData finish:^(BT_CONN_RESULT r) {
+            result = r;
+            dispatch_semaphore_signal(done);
+        }];
+    });
+
+    const int64_t timeoutNs = (int64_t)12 * NSEC_PER_SEC;
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeoutNs)) != 0) {
+        NSLog(@"Error: RFCOMM connect timed out after 12s\n");
+        NSInteger generation = self.connectGeneration;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self.connectGeneration) {
+                return;
+            }
+            // Invalidate so a late open-complete cannot leave a zombie channel.
+            self.connectGeneration++;
+            [self forceCloseRfcommChannel];
+            self.bounceBasebandBeforeNextConnect = YES;
+            IOBluetoothDevice *device = nil;
+            if ([Bluetooth getDevice:mac result:&device] && [device isConnected]) {
+                NSLog(@"Warning: Requesting baseband close for %@ after connect timeout\n", mac);
+                [device closeConnection];
+            }
+            BtConnectFinish finish = self.connectFinish;
+            self.connectFinish = nil;
+            self.pendingMac = nil;
+            self.pendingUuid = nil;
+            if (finish) {
+                finish(BT_CONN_EOPEN);
+            }
+        });
+        // Allow the main-queue cleanup to run before the next attempt.
+        [NSThread sleepForTimeInterval:0.5];
+        return BT_CONN_EOPEN;
+    }
+
+    return result;
+}
+
+- (void)beginConnectOnMain:(NSString *)mac
+                       uuid:(NSData *)uuidData
+                     finish:(BtConnectFinish)finish
+{
+    NSInteger generation = ++self.connectGeneration;
+    self.connectFinish = finish;
+    self.pendingMac = mac;
+    self.pendingUuid = uuidData;
+    self.continuedAfterSdp = NO;
+
     if (mRFCOMMChannel != nil) {
-        NSLog(@"Error: Already connected. Disconnecting.. **This should never happen**\n");
-        [self disconnect];
-        return BT_CONN_EUNKNOWN;
+        NSLog(@"Warning: Cleaning up existing RFCOMM channel before connect\n");
+        [self forceCloseRfcommChannel];
     }
-    IOReturn status;
-    int i;
+
     IOBluetoothDevice *device = NULL;
-
-    bool found = [Bluetooth getDevice:mac result:&device];
-
-    if (!found) {
-        return BT_CONN_ENOTPAIRED;
+    if (![Bluetooth getDevice:mac result:&device]) {
+        [self finishConnect:BT_CONN_ENOTPAIRED generation:generation];
+        return;
     }
 
-    IOBluetoothSDPUUID *parsedUuid = [IOBluetoothSDPUUID uuidWithBytes:uuid length:16];
+    // After Samsung Wearable (or a failed RFCOMM open) the existing ACL often cannot
+    // host a new GEARMANAGER channel until it is torn down and reopened.
+    if (self.bounceBasebandBeforeNextConnect) {
+        self.bounceBasebandBeforeNextConnect = NO;
+        [self bounceBasebandForMac:mac];
+        // Re-resolve in case IOBluetooth replaced the object.
+        if (![Bluetooth getDevice:mac result:&device]) {
+            [self finishConnect:BT_CONN_ENOTPAIRED generation:generation];
+            return;
+        }
+    }
 
-    // Before we can open the RFCOMM channel, we need to open a connection to the device.
-    // The openRFCOMMChannel... API probably should do this for us, but for now we have to
-    // do it manually.
-    // (needed for sdp too: https://github.com/NSTerminal/terminal/blob/78316cee045c5156c12606e78fa58d1e01e7e0ef/swift/Sources/btutils.swift#L76)
     if (![device isConnected]) {
-        status = [device openConnection];
-        
+        NSLog(@"Warning: Device baseband not connected; attempting openConnection\n");
+        IOReturn status = [device openConnection];
         if (status == kIOReturnTimeout) {
-            return BT_CONN_ENOTFOUND;
+            [self finishConnect:BT_CONN_ENOTFOUND generation:generation];
+            return;
         }
         if (status != kIOReturnSuccess) {
-            NSLog(@"Error: %s opening connection to device.\n", mach_error_string(status) );
-            return BT_CONN_EBASECONN;
+            NSLog(@"Error: %s opening connection to device.\n", mach_error_string(status));
+            [self finishConnect:BT_CONN_EBASECONN generation:generation];
+            return;
         }
     }
 
     sdpQueryDone = NO;
     // sdp query with uuids specified silently fails since Ventura, ref https://developer.apple.com/forums/thread/722228
-    status = [device performSDPQuery:self];
-
+    IOReturn status = [device performSDPQuery:self];
     if (status != kIOReturnSuccess) {
         NSLog(@"Error: %s starting SDP query.\n", mach_error_string(status));
-        // Do not fail hard, instead get a proper error message and let it be
-    } else {
-        // Poll until SDP query is done, to keep code and threading simple.
-        i = 0;
-        while (!sdpQueryDone && i++ < 15)
-            //[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-            [NSThread sleepForTimeInterval:0.1];
-        if (!sdpQueryDone)
-            NSLog(@"Warning: SDP query timed out.\n");
+        // Fall through and try cached records immediately.
+        [self continueConnectAfterSdp:device generation:generation];
+        return;
     }
 
+    // Soft timeout for SDP: use cached records if the callback is slow.
+    __weak Bluetooth *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        Bluetooth *strongSelf = weakSelf;
+        if (!strongSelf || generation != strongSelf.connectGeneration || strongSelf->sdpQueryDone) {
+            return;
+        }
+        NSLog(@"Warning: SDP query timed out.\n");
+        strongSelf->sdpQueryDone = YES;
+        [strongSelf continueConnectAfterSdp:device generation:generation];
+    });
+}
+
+- (void)continueConnectAfterSdp:(IOBluetoothDevice *)device generation:(NSInteger)generation
+{
+    if (generation != self.connectGeneration || self.connectFinish == nil) {
+        return;
+    }
+    if (self.continuedAfterSdp) {
+        return;
+    }
+    self.continuedAfterSdp = YES;
+
+    const UInt8 *uuidBytes = (const UInt8 *)self.pendingUuid.bytes;
+    IOBluetoothSDPUUID *parsedUuid = [IOBluetoothSDPUUID uuidWithBytes:uuidBytes length:16];
     IOBluetoothSDPServiceRecord *serviceRecord = [device getServiceRecordForUUID:parsedUuid];
 
     if (serviceRecord == nil) {
         NSLog(@"Error - service in selected device. ***This should never happen.***\n", NULL);
-        return BT_CONN_ESDP;
+        [self finishConnect:BT_CONN_ESDP generation:generation];
+        return;
     }
 
-    // To connect we need a device to connect and an RFCOMM channel ID to open on the device:
     UInt8 rfcommChannelID;
-    status = [serviceRecord getRFCOMMChannelID:&rfcommChannelID];
-
-    // Check to make sure the service record actually had an RFCOMM channel ID
+    IOReturn status = [serviceRecord getRFCOMMChannelID:&rfcommChannelID];
     if (status != kIOReturnSuccess) {
         NSLog(@"Error: %s getting RFCOMM channel ID from service.\n", mach_error_string(status));
-        return BT_CONN_ECID;
+        [self finishConnect:BT_CONN_ECID generation:generation];
+        return;
     }
 
     NSLog(@"Service selected '%@' - RFCOMM Channel ID = %u\n", [serviceRecord getServiceName], rfcommChannelID);
 
-    // Open the RFCOMM channel on the new device connection
-    IOBluetoothRFCOMMChannel *tempRFCOMMChannel = mRFCOMMChannel;
-    status = [device openRFCOMMChannelSync:&tempRFCOMMChannel withChannelID:rfcommChannelID delegate:self];
+    IOBluetoothRFCOMMChannel *tempRFCOMMChannel = nil;
+    status = [device openRFCOMMChannelAsync:&tempRFCOMMChannel
+                             withChannelID:rfcommChannelID
+                                  delegate:self];
     mRFCOMMChannel = tempRFCOMMChannel;
-    
-    if (mRFCOMMChannel == nil) {
-        NSLog(@"Error: %s - unable to open RFCOMM channel.\n", mach_error_string(status) );
-        [self disconnect];
-        return BT_CONN_EOPEN;
+
+    if (status != kIOReturnSuccess || mRFCOMMChannel == nil) {
+        NSLog(@"Error: %s - unable to start RFCOMM channel open.\n", mach_error_string(status));
+        [self failRfcommOpen:generation];
+        return;
     }
 
-    // Poll until RFCOMM channel is open, to keep code and threading simple.
-    i = 0;
-    while (![mRFCOMMChannel isOpen] && i++ < 15)
-        //[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-        [NSThread sleepForTimeInterval:0.1];
-
-    // Ignoring the returned error if RFCOMM channel is open
-    // Documentation states that if status is not success, RFCOMM channel won't be set
-    // For unknown reasons, status is always kIOReturnError even if connection was successful
-    // As it appears to be a macOS bug, we work it around by using openRFCOMMChannelSync
-    // then relying on RFCOMM channel to open after at most 1.5s (it does not open instantly even
-    // though it's the Sync API)
-    if (/*( status != kIOReturnSuccess ) || (*/ ![mRFCOMMChannel isOpen] /*)*/) {
-        NSLog(@"Error: %s - unable to open RFCOMM channel.\n", mach_error_string(status) );
-        [self disconnect];
-        return BT_CONN_EOPEN;
-    } else {
-        if ( status != kIOReturnSuccess ) {
-            NSLog(@"Warning: got %s while trying to open RFCOMM channel, but it's open anyway\n", mach_error_string(status) );
+    // Safety timeout if open-complete never arrives.
+    __weak Bluetooth *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        Bluetooth *strongSelf = weakSelf;
+        if (!strongSelf || generation != strongSelf.connectGeneration || strongSelf.connectFinish == nil) {
+            return;
         }
-        _macAddress = [[NSString alloc] initWithString:mac];
-        return BT_CONN_SUCCESS;
+        if (strongSelf->mRFCOMMChannel != nil && [strongSelf->mRFCOMMChannel isOpen]) {
+            return;
+        }
+        NSLog(@"Error: RFCOMM open-complete timed out\n");
+        [strongSelf failRfcommOpen:generation];
+    });
+}
+
+- (void)failRfcommOpen:(NSInteger)generation
+{
+    NSString *mac = [self.pendingMac copy];
+    [self forceCloseRfcommChannel];
+    self.bounceBasebandBeforeNextConnect = YES;
+
+    // Don't wait here (would stack on top of the 8s open timeout). Next connect
+    // waits for ACL drop via bounceBasebandBeforeNextConnect.
+    IOBluetoothDevice *device = nil;
+    if (mac.length > 0 && [Bluetooth getDevice:mac result:&device] && [device isConnected]) {
+        NSLog(@"Warning: Requesting baseband close for %@ after RFCOMM failure\n", mac);
+        [device closeConnection];
+    }
+
+    [self finishConnect:BT_CONN_EOPEN generation:generation];
+}
+
+- (void)bounceBasebandForMac:(NSString *)mac
+{
+    if (mac.length == 0) {
+        return;
+    }
+
+    IOBluetoothDevice *device = nil;
+    if (![Bluetooth getDevice:mac result:&device] || device == nil) {
+        return;
+    }
+
+    if ([device isConnected]) {
+        NSLog(@"Warning: Bouncing baseband ACL for %@ to recover RFCOMM\n", mac);
+        [device closeConnection];
+    }
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:4.0];
+    while ([device isConnected] && [deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                 beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+
+    if ([device isConnected]) {
+        NSLog(@"Warning: Baseband still connected after bounce wait\n");
+    } else {
+        NSLog(@"Baseband closed; opening a fresh ACL for RFCOMM\n");
     }
 }
 
@@ -131,10 +278,36 @@
         NSLog(@"Error: %s performing SDP query.\n", mach_error_string(status));
     }
 
+    if (sdpQueryDone) {
+        // Soft timeout already continued.
+        return;
+    }
     sdpQueryDone = YES;
+
+    NSInteger generation = self.connectGeneration;
+    [self continueConnectAfterSdp:device generation:generation];
 }
 
-- (BOOL)disconnect
+- (void)rfcommChannelOpenComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel status:(IOReturn)status
+{
+    NSInteger generation = self.connectGeneration;
+    if (generation == 0 || self.connectFinish == nil) {
+        return;
+    }
+
+    if (status != kIOReturnSuccess || rfcommChannel == nil || ![rfcommChannel isOpen]) {
+        NSLog(@"Error: %s - unable to open RFCOMM channel.\n", mach_error_string(status));
+        [self failRfcommOpen:generation];
+        return;
+    }
+
+    mRFCOMMChannel = rfcommChannel;
+    _macAddress = [[NSString alloc] initWithString:self.pendingMac ?: @""];
+    NSLog(@"RFCOMM channel open complete\n");
+    [self finishConnect:BT_CONN_SUCCESS generation:generation];
+}
+
+- (void)forceCloseRfcommChannel
 {
     if (mRFCOMMChannel != nil) {
         // This will close the RFCOMM channel and start an inactivity timer to close the baseband connection if no
@@ -146,12 +319,50 @@
     }
     
     _macAddress = NULL;
+}
+
+- (void)requestBasebandBounceForNextConnect:(NSString *)mac
+{
+    // Only arm the flag — the actual close happens once inside beginConnect.
+    // Closing here caused: close → macOS reconnect → OnConnected → close again.
+    self.bounceBasebandBeforeNextConnect = YES;
+    NSLog(@"RFCOMM reconnect will bounce baseband ACL for %@ once\n", mac ?: @"(unknown)");
+}
+
+- (BOOL)disconnect
+{
+    // Invalidate any in-flight async connect so its callbacks become no-ops.
+    self.connectGeneration++;
+    BtConnectFinish finish = self.connectFinish;
+    self.connectFinish = nil;
+    self.pendingMac = nil;
+    self.pendingUuid = nil;
+
+    void (^doClose)(void) = ^{
+        [self forceCloseRfcommChannel];
+    };
+
+    if ([NSThread isMainThread]) {
+        doClose();
+    } else {
+        // Timed wait — never dispatch_sync(main); main may be busy with IOBluetooth.
+        dispatch_semaphore_t closed = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            doClose();
+            dispatch_semaphore_signal(closed);
+        });
+        dispatch_semaphore_wait(closed, dispatch_time(DISPATCH_TIME_NOW, (int64_t)2 * NSEC_PER_SEC));
+    }
+
+    if (finish) {
+        finish(BT_CONN_EOPEN);
+    }
 
     return TRUE;
 }
 
 - (BOOL)isConnected {
-    return mRFCOMMChannel != nil;
+    return mRFCOMMChannel != nil && [mRFCOMMChannel isOpen];
 }
 
 - (BT_ENUM_RESULT)enumerate:(EnumerationResult *)result {
@@ -253,7 +464,12 @@
 }
 
 - (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)rfcommChannel {
-    [self disconnect];
+    // Ignore close of a superseded channel while a new connect is in flight.
+    if (rfcommChannel != mRFCOMMChannel && mRFCOMMChannel != nil) {
+        return;
+    }
+
+    [self forceCloseRfcommChannel];
     if (_onChannelClosed) {
         _onChannelClosed();
     }

@@ -7,6 +7,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
@@ -59,6 +60,7 @@ public class App : Application
     
     private BudsPopup? _popup;
     private bool _popupShown;
+    private CancellationTokenSource? _popupShowCts;
     private LegacyWearStates _lastWearState = LegacyWearStates.Both;
     
     public override void Initialize()
@@ -129,6 +131,7 @@ public class App : Application
         BluetoothImpl.Instance.BluetoothError += OnBluetoothError;
         BluetoothImpl.Instance.Disconnected += OnDisconnected;
         BluetoothImpl.Instance.Connected += OnConnected;
+        BluetoothImpl.Instance.Connecting += OnConnecting;
         SppMessageReceiver.Instance.StatusUpdate += OnStatusUpdate;
         SppMessageReceiver.Instance.OtherOption += HandleOtherTouchOption;
         SppMessageReceiver.Instance.ExtendedStatusUpdate += OnExtendedStatusUpdate;
@@ -157,48 +160,134 @@ public class App : Application
                 MainWindow.Instance.ToggleVisibility();
                 break;
             case Event.ShowBatteryPopup:
-                ShowPopup(true);
+                _ = ShowPopupAsync(BudsPopupMode.Battery, noDebounce: true);
                 break;
         }
     }
     
-    private void ShowPopup(bool noDebounce = false)
+    private void ShowPopup(BudsPopupMode mode = BudsPopupMode.Battery, bool noDebounce = false)
     {
-        if (!PlatformUtils.IsDesktop || (_popupShown && !noDebounce))
+        _ = ShowPopupAsync(mode, noDebounce);
+    }
+
+    private async Task ShowPopupAsync(BudsPopupMode mode = BudsPopupMode.Battery, bool noDebounce = false)
+    {
+        if (!PlatformUtils.IsDesktop)
             return;
-        
-        if (_popup is { IsVisible: true })
+
+        // Coalesce rapid Connecting events (retries / double baseband callbacks).
+        _popupShowCts?.Cancel();
+        _popupShowCts?.Dispose();
+        _popupShowCts = new CancellationTokenSource();
+        var token = _popupShowCts.Token;
+
+        try
         {
-            _popup.UpdateSettings();
-            _popup.RearmTimer();
+            if (token.IsCancellationRequested)
+                return;
+
+            await Dispatcher.UIThread.InvokeAsync(async () =>
+            {
+                if (token.IsCancellationRequested)
+                    return;
+
+                if (_popupShown && !noDebounce && mode == BudsPopupMode.Battery)
+                    return;
+
+                if (_popup is { IsPresented: true } && _popup.Mode == mode)
+                {
+                    if (mode == BudsPopupMode.Battery)
+                        _popup.RearmTimer();
+                    _popupShown = true;
+                    return;
+                }
+
+                if (_popup is { IsPresented: true })
+                {
+                    _popup.SetMode(mode);
+                    if (mode == BudsPopupMode.Battery)
+                        _popup.RearmTimer();
+                    _popupShown = true;
+                    return;
+                }
+
+                EnsurePopupInstance();
+                _popup!.SetMode(mode);
+                _popupShown = true;
+                await _popup.ShowAnimatedAsync().ConfigureAwait(true);
+            }, DispatcherPriority.Normal).ConfigureAwait(true);
         }
-        
-        Dialogs.ShowAsSingleInstanceOnDesktop(ref _popup); 
-        _popupShown = true;
+        catch (OperationCanceledException)
+        {
+        }
+        catch (InvalidOperationException)
+        {
+            // Window was closed externally — recreate once.
+            _popup = new BudsPopup();
+            _popup.SetMode(mode);
+            _popupShown = true;
+            await _popup.ShowAnimatedAsync().ConfigureAwait(true);
+        }
+    }
+
+    private void EnsurePopupInstance()
+    {
+        _popup ??= new BudsPopup();
+    }
+
+    private void HidePopup()
+    {
+        _popupShowCts?.Cancel();
+        if (_popup is { IsPresented: true } or { IsVisible: true })
+            _popup.Hide(force: false);
+        _popupShown = false;
+    }
+
+    private void HidePopupImmediate()
+    {
+        _popupShowCts?.Cancel();
+        if (_popup is { IsPresented: true } or { IsVisible: true })
+            _popup.Hide(force: true);
+        _popupShown = false;
+    }
+
+    private void OnConnecting(object? sender, EventArgs e)
+    {
+        // Always surface connecting state on desktop — ACL bounce briefly drops audio
+        // and users need to know the app is still working.
+        _ = ShowPopupAsync(BudsPopupMode.Connecting, noDebounce: true);
     }
     
     private void OnConnected(object? sender, EventArgs e)
     {
-        _popupShown = false;
+        // Keep connecting popup until battery status arrives (or hide if popup disabled).
+        // Hide respects the minimum connecting dwell so the message stays readable.
+        if (!Settings.Data.PopupEnabled)
+            Dispatcher.UIThread.Post(HidePopup, DispatcherPriority.Background);
     }
 
     private void OnBluetoothError(object? sender, BluetoothException e)
     {
         WindowIconRenderer.ResetIconToDefault();
-        _popupShown = false;
+        Dispatcher.UIThread.Post(HidePopupImmediate, DispatcherPriority.Background);
     }
     
     private void OnDisconnected(object? sender, string e)
     {
         WindowIconRenderer.ResetIconToDefault();
-        _popupShown = false;
+        // Do not hide here: macOS ACL bounce intentionally disconnects briefly while
+        // Connecting mode is still in progress. Battery mode still auto-hides via timer.
     }
     
     private void OnExtendedStatusUpdate(object? sender, ExtendedStatusUpdateDecoder e)
     {
         if (Settings.Data.PopupEnabled)
         {
-            ShowPopup();
+            _ = ShowPopupAsync(BudsPopupMode.Battery, noDebounce: true);
+        }
+        else
+        {
+            HidePopup();
         }
             
         // Update dynamic tray icon

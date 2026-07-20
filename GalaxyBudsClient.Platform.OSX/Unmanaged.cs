@@ -68,6 +68,8 @@ internal static class Bluetooth
     [DllImport(DSO.Name)]
     internal static extern unsafe bool bt_disconnect(BluetoothImpl* self);
     [DllImport(DSO.Name)]
+    internal static extern unsafe void bt_request_baseband_bounce(BluetoothImpl* self, string mac);
+    [DllImport(DSO.Name)]
     internal static extern unsafe BT_SEND_RESULT bt_send(BluetoothImpl* self, byte* data, uint length);
     [DllImport(DSO.Name)]
     internal static extern unsafe BT_ENUM_RESULT bt_enumerate(BluetoothImpl* self, ref EnumerationResult result);

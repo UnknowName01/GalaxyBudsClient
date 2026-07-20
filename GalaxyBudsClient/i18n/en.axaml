@@ -59,6 +59,8 @@ Right: {1}</sys:String>
     <sys:String x:Key="connpopup_placement_br">Bottom right</sys:String>
     <sys:String x:Key="connpopup_title">{0}'s {1}</sys:String>
     <!--Note: If a pair of Buds+ is connected then a plus sign will be appended to connpopup_title-->
+    <sys:String x:Key="connpopup_connecting">Connecting to earbuds…</sys:String>
+    <sys:String x:Key="connpopup_connecting_hint">Audio may briefly disconnect while establishing control.</sys:String>
 
     <!--Placement  (Buds+)-->
     <sys:String x:Key="placement_disconnected">Disconnected</sys:String>

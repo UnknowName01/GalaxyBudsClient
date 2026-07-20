@@ -37,6 +37,7 @@ extern void bt_free(BluetoothImpl *self);
 
 extern BT_CONN_RESULT bt_connect(BluetoothImpl *self, const char *mac, const unsigned char *uuid);
 extern bool bt_disconnect(BluetoothImpl *self);
+extern void bt_request_baseband_bounce(BluetoothImpl *self, const char *mac);
 extern BT_SEND_RESULT bt_send(BluetoothImpl *self, void *data, unsigned int length);
 extern BT_ENUM_RESULT bt_enumerate(BluetoothImpl *self, EnumerationResult *result);
 extern bool bt_is_connected(BluetoothImpl *self);

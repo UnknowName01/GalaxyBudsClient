@@ -59,6 +59,8 @@ Phải: {1}</sys:String>
     <sys:String x:Key="connpopup_placement_br">Góc phải phía dưới</sys:String>
     <sys:String x:Key="connpopup_title">{1} của {0}</sys:String>
     <!--Note: If a pair of Buds+ is connected then a plus sign will be appended to connpopup_title-->
+    <sys:String x:Key="connpopup_connecting">Đang kết nối tai nghe…</sys:String>
+    <sys:String x:Key="connpopup_connecting_hint">Âm thanh có thể ngắt giây lát trong khi thiết lập điều khiển.</sys:String>
 
     <!--Placement  (Buds+)-->
     <sys:String x:Key="placement_disconnected">Đã ngắt kết nối</sys:String>

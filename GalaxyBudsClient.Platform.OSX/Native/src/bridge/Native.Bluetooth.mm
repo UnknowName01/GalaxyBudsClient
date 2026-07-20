@@ -30,6 +30,11 @@ bool bt_disconnect(BluetoothImpl *self) {
     return [self->client disconnect];
 }
 
+void bt_request_baseband_bounce(BluetoothImpl *self, const char *mac) {
+    NSString *nsMac = [NSString stringWithCString:mac encoding:[NSString defaultCStringEncoding]];
+    [self->client requestBasebandBounceForNextConnect:nsMac];
+}
+
 BT_SEND_RESULT bt_send(BluetoothImpl *self, void *data, unsigned int length) {
     return [self->client sendData:static_cast<char *>(data) length:length];
 }
