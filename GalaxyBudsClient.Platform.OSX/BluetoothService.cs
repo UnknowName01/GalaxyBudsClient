@@ -17,10 +17,6 @@ namespace GalaxyBudsClient.Platform.OSX
 
         private string _currentMac = string.Empty;
         private string _currentUuid = string.Empty;
-        private CancellationTokenSource? _autoReconnectCts;
-        private int _connectInFlight;
-        /// <summary>Non-zero while an auto-reconnect pipeline is running — ignore further baseband OnConnected.</summary>
-        private int _autoReconnectPending;
 
         public event EventHandler? RfcommConnected;
         public event EventHandler? Connecting;
@@ -103,7 +99,7 @@ namespace GalaxyBudsClient.Platform.OSX
         {
             return NativeUtf8ToString(ptr).Replace("-", ":");
         }
-
+        
         public bool IsStreamConnected
         {
             get
@@ -217,72 +213,6 @@ namespace GalaxyBudsClient.Platform.OSX
                 Memory.mem_free(mac.ToPointer());
                 Memory.mem_free(name.ToPointer());
             }
-
-            if (!shouldReconnect)
-                return;
-
-            // Only one reconnect pipeline — baseband bounce itself re-fires OnConnected.
-            if (Interlocked.CompareExchange(ref _autoReconnectPending, 1, 0) != 0)
-                return;
-
-            _autoReconnectCts?.Cancel();
-            _autoReconnectCts?.Dispose();
-            _autoReconnectCts = new CancellationTokenSource();
-            var token = _autoReconnectCts.Token;
-
-            var macToConnect = _currentMac;
-            var uuidToConnect = _currentUuid;
-            // After Mac Settings / phone handoff, ACL is up but RFCOMM on that link often
-            // times out. One bounce at connect time (not during the wait) avoids a loop of
-            // close → macOS reconnect → schedule again → close again.
-            Log.Debug("OSX.BluetoothService: Device {MacAddr} connected; scheduling RFCOMM reconnect in 2s (single ACL bounce)", macAddr);
-
-            // Surface "Connecting…" as soon as macOS reports the buds are linked (Settings /
-            // A2DP), not only when RFCOMM ConnectAsync starts ~2s later.
-            Connecting?.Invoke(this, EventArgs.Empty);
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(2000, token).ConfigureAwait(false);
-                    if (token.IsCancellationRequested || IsStreamConnected)
-                        return;
-                    if (Volatile.Read(ref _connectInFlight) != 0)
-                        return;
-                    if (!string.Equals(macToConnect, _currentMac, StringComparison.CurrentCultureIgnoreCase))
-                        return;
-
-                    // Mark next native connect to bounce ACL once, then open fresh.
-                    unsafe
-                    {
-                        Bluetooth.bt_request_baseband_bounce(_nativePtr, macToConnect);
-                    }
-
-                    Log.Debug("OSX.BluetoothService: Reconnecting RFCOMM to {MacAddr}", macToConnect);
-                    // Do NOT pass `token` into ConnectAsync: ConnectAsync cancels
-                    // _autoReconnectCts at start, which would self-cancel this attempt and
-                    // leave the UI stuck on "Connecting" until the user taps Connect.
-                    await ConnectAsync(macToConnect, uuidToConnect, CancellationToken.None)
-                        .ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    // Superseded by another reconnect schedule or an explicit connect.
-                }
-                catch (BluetoothException ex)
-                {
-                    BluetoothErrorAsync?.Invoke(this, ex);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "OSX.BluetoothService: Scheduled RFCOMM reconnect failed");
-                }
-                finally
-                {
-                    Interlocked.Exchange(ref _autoReconnectPending, 0);
-                }
-            }, token);
         }
 
         #endregion
@@ -290,24 +220,14 @@ namespace GalaxyBudsClient.Platform.OSX
         #region Connection
         public async Task ConnectAsync(string macAddress, string uuid, CancellationToken cancelToken)
         {
-            // Connect can hold the lock for a long time (SDP/RFCOMM waits + retries).
-            var semResult = await ConnSemaphore.WaitAsync(120000, cancelToken);
+            var semResult = await ConnSemaphore.WaitAsync(5000, cancelToken);
             if (semResult == false)
             {
                 Log.Error("OSX.BluetoothService: Connection attempt timed out due to blocked semaphore");
                 throw new BluetoothException(BluetoothException.ErrorCodes.TimedOut, "Timed out while waiting to enter connection phase. Another task is already preparing a connection.");
             }
 
-            Interlocked.Exchange(ref _connectInFlight, 1);
             try {
-                // Cancel a *pending* auto-reconnect delay only. Never cancel the token
-                // belonging to this ConnectAsync call (see OnConnected scheduler).
-                if (_autoReconnectCts is { IsCancellationRequested: false } pending
-                    && pending.Token != cancelToken)
-                {
-                    pending.Cancel();
-                }
-
                 if (IsStreamConnected)
                 {
                     Log.Debug("OSX.BluetoothService: Already connected, skipped");
@@ -319,51 +239,15 @@ namespace GalaxyBudsClient.Platform.OSX
                 _currentMac = macAddress;
                 _currentUuid = uuid;
 
-                const int maxAttempts = 3;
-                BT_CONN_RESULT result = BT_CONN_RESULT.BT_CONN_EUNKNOWN;
-                for (var attempt = 1; attempt <= maxAttempts; attempt++)
+                BT_CONN_RESULT result;
+                unsafe
                 {
-                    cancelToken.ThrowIfCancellationRequested();
-                    if (IsStreamConnected)
-                        return;
-
-                    if (attempt > 1)
+                    var uuidBytes = new Guid(uuid).ToByteArray();
+                    uuidBytes.FixEndiannessOfGuidBytes();
+                    fixed (byte* rawUuid = uuidBytes)
                     {
-                        // Native fail path already bounced ACL; settle so buds accept a new SPP host.
-                        unsafe
-                        {
-                            Bluetooth.bt_disconnect(_nativePtr);
-                        }
-
-                        await Task.Delay(TimeSpan.FromSeconds(attempt + 2), cancelToken).ConfigureAwait(false);
+                        result = Bluetooth.bt_connect(_nativePtr, macAddress, rawUuid);
                     }
-
-                    // Native connect waits on a semaphore while main runs async IOBluetooth work.
-                    // Keep it off the UI thread so Avalonia can pump the run loop.
-                    var mac = macAddress;
-                    var uuidCopy = uuid;
-                    result = await Task.Run(() =>
-                    {
-                        unsafe
-                        {
-                            var uuidBytes = new Guid(uuidCopy).ToByteArray();
-                            uuidBytes.FixEndiannessOfGuidBytes();
-                            fixed (byte* rawUuid = uuidBytes)
-                            {
-                                return Bluetooth.bt_connect(_nativePtr, mac, rawUuid);
-                            }
-                        }
-                    }, cancelToken).ConfigureAwait(false);
-
-                    if (result == BT_CONN_RESULT.BT_CONN_SUCCESS)
-                        break;
-
-                    if (result != BT_CONN_RESULT.BT_CONN_EOPEN || attempt == maxAttempts)
-                        break;
-
-                    Log.Warning(
-                        "OSX.BluetoothService: RFCOMM open failed (attempt {Attempt}/{Max}), will cleanup and retry",
-                        attempt, maxAttempts);
                 }
 
                 if (result != BT_CONN_RESULT.BT_CONN_SUCCESS)
@@ -406,7 +290,6 @@ namespace GalaxyBudsClient.Platform.OSX
             }
             finally
             {
-                Interlocked.Exchange(ref _connectInFlight, 0);
                 ConnSemaphore.Release();
             }
         }
@@ -416,8 +299,7 @@ namespace GalaxyBudsClient.Platform.OSX
         public async Task DisconnectAsync()
         {
             Log.Debug("OSX.BluetoothService: Disconnecting...");
-            _autoReconnectCts?.Cancel();
-            var semResult = await ConnSemaphore.WaitAsync(120000);
+            var semResult = await ConnSemaphore.WaitAsync(5000);
             if (semResult == false)
             {
                 Log.Error("OSX.BluetoothService: Disconnection attempt timed out due to blocked semaphore");

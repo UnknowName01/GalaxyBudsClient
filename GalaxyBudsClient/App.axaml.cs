@@ -7,7 +7,6 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
@@ -60,7 +59,6 @@ public class App : Application
     
     private BudsPopup? _popup;
     private bool _popupShown;
-    private CancellationTokenSource? _popupShowCts;
     private LegacyWearStates _lastWearState = LegacyWearStates.Both;
     
     public override void Initialize()
@@ -153,7 +151,6 @@ public class App : Application
         BluetoothImpl.Instance.BluetoothError += OnBluetoothError;
         BluetoothImpl.Instance.Disconnected += OnDisconnected;
         BluetoothImpl.Instance.Connected += OnConnected;
-        BluetoothImpl.Instance.Connecting += OnConnecting;
         SppMessageReceiver.Instance.StatusUpdate += OnStatusUpdate;
         SppMessageReceiver.Instance.OtherOption += HandleOtherTouchOption;
         // ExtendedStatusUpdate subscribed earlier (before MainWindow) — see comment there
@@ -183,12 +180,12 @@ public class App : Application
                 MainWindow.Instance.ToggleVisibility();
                 break;
             case Event.ShowBatteryPopup:
-                _ = ShowPopupAsync(BudsPopupMode.Battery, noDebounce: true);
+                ShowPopup(true);
                 break;
         }
     }
     
-    private void ShowPopup(BudsPopupMode mode = BudsPopupMode.Battery, bool noDebounce = false)
+    private void ShowPopup(bool noDebounce = false)
     {
         if (!PlatformUtils.IsDesktop || (_popupShown && !noDebounce))
             return;
@@ -215,7 +212,7 @@ public class App : Application
     private void OnBluetoothError(object? sender, BluetoothException e)
     {
         WindowIconRenderer.ResetIconToDefault();
-        Dispatcher.UIThread.Post(HidePopupImmediate, DispatcherPriority.Background);
+        _popupShown = false;
     }
     
     private void OnDisconnected(object? sender, string e)
@@ -229,11 +226,7 @@ public class App : Application
     {
         if (Settings.Data.PopupEnabled)
         {
-            _ = ShowPopupAsync(BudsPopupMode.Battery, noDebounce: true);
-        }
-        else
-        {
-            HidePopup();
+            ShowPopup();
         }
             
         // Update dynamic tray icon

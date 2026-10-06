@@ -3,9 +3,6 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:controls="clr-namespace:GalaxyBudsClient.Interface.Controls"
-        xmlns:ic="clr-namespace:FluentIcons.Avalonia.Fluent;assembly=FluentIcons.Avalonia.Fluent"
-        xmlns:ext="clr-namespace:GalaxyBudsClient.Interface.MarkupExtensions"
-        xmlns:i18N="clr-namespace:GalaxyBudsClient.Generated.I18N"
         mc:Ignorable="d"
         x:Class="GalaxyBudsClient.Interface.Dialogs.BudsPopup"
         Height="205" 
@@ -28,18 +25,42 @@
         PointerPressed="Window_OnPointerPressed">
 
     <Border Name="OuterBorder"
-            Opacity="0"
             BorderBrush="{DynamicResource SurfaceStrokeColorFlyoutBrush}"
             BorderThickness="1"
             Background="{DynamicResource SolidBackgroundFillColorBaseBrush}"
             CornerRadius="{StaticResource OverlayCornerRadius}">
-        <Border.Transitions>
-            <Transitions>
-                <DoubleTransition Property="Opacity"
-                                  Duration="0:0:0.35"
-                                  Easing="CubicEaseOut" />
-            </Transitions>
-        </Border.Transitions>
+        <Border.Styles>
+            <Style Selector="Border[Tag=showing]">
+                <Style.Animations>
+                    <Animation IterationCount="1"
+                               PlaybackDirection="Normal"
+                               FillMode="Both"
+                               Duration="0:0:.4">
+                        <KeyFrame Cue="0%">
+                            <Setter Property="Opacity" Value="0.0" />
+                        </KeyFrame>
+                        <KeyFrame Cue="100%">
+                            <Setter Property="Opacity" Value="1.0" />
+                        </KeyFrame>
+                    </Animation>
+                </Style.Animations>
+            </Style>
+            <Style Selector="Border[Tag=hiding]">
+                <Style.Animations>
+                    <Animation IterationCount="1"
+                               PlaybackDirection="Normal"
+                               FillMode="Both"
+                               Duration="0:0:.4">
+                        <KeyFrame Cue="0%">
+                            <Setter Property="Opacity" Value="1.0" />
+                        </KeyFrame>
+                        <KeyFrame Cue="100%">
+                            <Setter Property="Opacity" Value="0.0" />
+                        </KeyFrame>
+                    </Animation>
+                </Style.Animations>
+            </Style>
+        </Border.Styles>
 
         <Grid Name="Grid" 
               RowDefinitions="35,*"
@@ -50,30 +71,7 @@
                    Content="Blank's Galaxy Buds"
                    FontSize="18" />
             
-            <controls:EarbudCompactStatusUnit Name="BatteryStatus"
-                                              Grid.Row="1"
-                                              IsVisible="False" />
-
-            <StackPanel Name="ConnectingStatus"
-                        Grid.Row="1"
-                        IsVisible="False"
-                        Spacing="8"
-                        HorizontalAlignment="Center"
-                        VerticalAlignment="Center">
-                <ic:SymbolIcon Symbol="CallConnecting"
-                               FontSize="40"
-                               HorizontalAlignment="Center"
-                               Foreground="{DynamicResource TextFillColorDisabledBrush}" />
-                <TextBlock Text="{ext:Translate {x:Static i18N:Keys.ConnpopupConnecting}}"
-                           TextAlignment="Center"
-                           FontSize="16" />
-                <TextBlock Text="{ext:Translate {x:Static i18N:Keys.ConnpopupConnectingHint}}"
-                           TextAlignment="Center"
-                           TextWrapping="Wrap"
-                           Opacity="0.65"
-                           MaxWidth="260"
-                           FontSize="13" />
-            </StackPanel>
+            <controls:EarbudCompactStatusUnit Grid.Row="1" />
         </Grid>
     </Border>
 </Window>

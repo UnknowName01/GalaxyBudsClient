@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Media;
@@ -10,23 +11,38 @@ using GalaxyBudsClient.Message.Decoder;
 using GalaxyBudsClient.Model.Config;
 using GalaxyBudsClient.Model.Constants;
 using GalaxyBudsClient.Platform;
+using Serilog;
 using Bitmap = Avalonia.Media.Imaging.Bitmap;
 using Brushes = Avalonia.Media.Brushes;
+using MainWindow = GalaxyBudsClient.Interface.MainWindow;
 using Point = Avalonia.Point;
 
 namespace GalaxyBudsClient.Utils.Interface;
 
 public static class WindowIconRenderer
 {
-    private const double CanvasHeight = 256;
-    private const double Padding = 6;
-    private const double Gap = 14;
-    /// <summary>Extra scale for battery % after fitting into the text area.</summary>
-    private const double BatteryTextScaleBoost = 1.28;
+    /// <summary>
+    /// AppKit shrinks status bar images to floor(menuFontSize * 4/3) points tall, so the layout is
+    /// authored directly in those final points and only the rasterization scale changes per screen.
+    /// </summary>
+    private const double CanvasHeight = 17;
+    private const double EarbudHeight = 13;
+    /// <summary>Height of the battery percentage glyphs, matching the macOS menu bar text size.</summary>
+    private const double TextHeight = 11;
+    private const double Gap = 4;
+    private const double SidePadding = 1;
+    /// <summary>Windows and Linux trays rescale the bitmap themselves, so hand them a large one.</summary>
+    private const double GenericRenderScale = 15;
+    /// <summary>
+    /// Extra raster resolution handed to AppKit on top of the screen scale. Drawing a template
+    /// image at exactly 1:1 makes AppKit harden the alpha mask, which turns the earbud outline into
+    /// hard stair-steps; letting it resample instead keeps the anti-aliased edge intact.
+    /// </summary>
+    private const double Supersample = 2;
     private const int AnimFrameCount = 12;
     private static readonly TimeSpan AnimFrameInterval = TimeSpan.FromMilliseconds(20);
 
-    private static readonly Bitmap DefaultTrayBitmap = MakeDefaultBitmap();
+    private static readonly TrayArtwork Artwork = TrayArtwork.Load();
 
     private static DispatcherTimer? _animTimer;
     private static int _animFrame;
@@ -175,6 +191,32 @@ public static class WindowIconRenderer
     private static void EnsureVariableTrayWidth() { }
 #endif
 
+    /// <summary>
+    /// Pixels per layout point. On macOS this has to track the screen showing the menu bar, since
+    /// AppKit maps the bitmap onto a fixed point size and anything coarser just gets blurred away;
+    /// retina is assumed when detection fails.
+    /// </summary>
+    private static double RenderScale
+    {
+        get
+        {
+            if (!PlatformUtils.IsOSX)
+                return GenericRenderScale;
+
+            try
+            {
+                if (MainWindow.Instance.Screens.Primary?.Scaling is { } scaling and > 0)
+                    return Math.Clamp(Math.Round(scaling), 1, 3) * Supersample;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "WindowIconRenderer: cannot determine screen scaling");
+            }
+
+            return 2 * Supersample;
+        }
+    }
+
     /// <param name="progress">0 = earbud centered / % hidden; 1 = final earbud+% layout.</param>
     /// <param name="compact">
     /// When true (idle disconnected only), bitmap width is icon-sized so the pill stays narrow.
@@ -183,73 +225,33 @@ public static class WindowIconRenderer
     private static WindowIcon MakeBatteryFrame(int level, double progress, bool compact)
     {
         progress = Math.Clamp(progress, 0, 1);
-        var contentHeight = CanvasHeight - Padding * 2;
+        var scale = RenderScale;
 
-        var src = DefaultTrayBitmap;
-        var iconScale = contentHeight / src.Size.Height * 0.9;
-        var iconWidth = src.Size.Width * iconScale;
-        var iconHeight = src.Size.Height * iconScale;
+        var iconHeight = EarbudHeight * scale;
+        var iconWidth = iconHeight * Artwork.Aspect;
 
-        var formattedText = new FormattedText(
-            $"{level}%",
-            CultureInfo.CurrentCulture,
-            FlowDirection.LeftToRight,
-            Typeface.Default,
-            220,
-            Brushes.Black);
+        IBrush brush = PlatformUtils.IsOSX
+            ? Brushes.Black
+            : new SolidColorBrush(Settings.Data.AccentColor);
+        var text = BuildText($"{level}%", TextHeight * scale, brush);
 
-        var textGeometry = formattedText.BuildGeometry(new Point(0, 0))!;
-        var textBounds = textGeometry.Bounds;
+        var narrowWidth = SnapWidth(SidePadding * 2 * scale + iconWidth, scale);
+        var wideWidth = SnapWidth(narrowWidth + Gap * scale + text.Ink.Width, scale);
+        var width = compact ? narrowWidth : wideWidth;
+        var height = (int)Math.Round(CanvasHeight * scale);
 
-        var maxTextAreaWidth = Math.Max(48, iconWidth * 1.35);
-        var textScale = 0.0;
-        if (textBounds.Width > 0 && textBounds.Height > 0)
-        {
-            var fitScale = Math.Min(maxTextAreaWidth / textBounds.Width, contentHeight / textBounds.Height);
-            textScale = fitScale * BatteryTextScaleBoost;
-            textScale = Math.Min(textScale, maxTextAreaWidth * 1.05 / textBounds.Width);
-            textScale = Math.Min(textScale, contentHeight * 1.15 / textBounds.Height);
-        }
+        // macOS menu-bar items grow/shrink leftward (right edge stays put). Keep the earbud locked
+        // to that right edge at progress=0 so the narrow↔wide snap does not jump the icon on screen
+        // — only the empty left side appears/disappears.
+        var centeredIconX = (narrowWidth - iconWidth) / 2;
+        var iconX = compact
+            ? centeredIconX
+            : Lerp(wideWidth - narrowWidth + centeredIconX, SidePadding * scale, progress);
 
-        var scaledTextWidth = textBounds.Width * textScale;
-        var scaledTextHeight = textBounds.Height * textScale;
-
-        var narrowWidth = Padding * 2 + iconWidth;
-        var wideWidth = Padding * 2 + iconWidth + Gap + scaledTextWidth;
-        // Stable wide canvas while animating; compact only when idle-disconnected.
-        var narrowPixelW = Math.Max(2, (int)Math.Round(narrowWidth / 2.0) * 2);
-        var widePixelW = Math.Max(2, (int)Math.Round(wideWidth / 2.0) * 2);
-        var pixelWidth = compact ? narrowPixelW : widePixelW;
-        var pixelHeight = (int)CanvasHeight;
-
-        // macOS menu-bar items grow/shrink leftward (right edge stays put). Keep the
-        // earbud locked to that right edge at progress=0 so the narrow↔wide snap
-        // does not jump the icon on screen — only the empty left side appears/disappears.
-        var compactIconX = (narrowPixelW - iconWidth) / 2;
-        var iconXFromRight = narrowPixelW - compactIconX - iconWidth;
-        var wideIconXAtProgress0 = widePixelW - iconWidth - iconXFromRight;
-        var finalIconX = Padding;
-
-        double iconX;
-        if (compact)
-            iconX = compactIconX;
-        else
-            iconX = wideIconXAtProgress0 + (finalIconX - wideIconXAtProgress0) * progress;
-
-        var iconY = Padding + (contentHeight - iconHeight) / 2;
-
-        var textOriginX = iconX + iconWidth + Gap;
-        var textOriginY = Padding + (contentHeight - scaledTextHeight) / 2;
-        var textMatrix = Matrix.CreateScale(textScale, textScale) *
-                         Matrix.CreateTranslation(
-                             textOriginX - textBounds.X * textScale,
-                             textOriginY - textBounds.Y * textScale);
-
-        var render = new RenderTargetBitmap(
-            new PixelSize(pixelWidth, pixelHeight), new Vector(96, 96));
+        var render = new RenderTargetBitmap(new PixelSize(width, height), new Vector(96, 96));
         using (var ctx = render.CreateDrawingContext())
         {
-            ctx.PushRenderOptions(new RenderOptions
+            using var _ = ctx.PushRenderOptions(new RenderOptions
             {
                 BitmapInterpolationMode = BitmapInterpolationMode.HighQuality,
                 TextRenderingMode = TextRenderingMode.Antialias,
@@ -257,29 +259,105 @@ public static class WindowIconRenderer
                 RequiresFullOpacityHandling = true
             });
 
-            ctx.DrawImage(src, new Rect(iconX, iconY, iconWidth, iconHeight));
+            ctx.DrawImage(Artwork.Bitmap, Artwork.Ink,
+                new Rect(iconX, (height - iconHeight) / 2, iconWidth, iconHeight));
 
-            if (!compact && progress > 0.01 && textScale > 0)
+            if (!compact && progress > 0.01)
             {
+                // Both ink boxes share the canvas center line so digits and earbud read as one unit
+                var origin = new Point(
+                    iconX + iconWidth + Gap * scale - text.Ink.X,
+                    (height - text.Ink.Height) / 2 - text.Ink.Y);
                 using (ctx.PushOpacity(progress))
-                using (ctx.PushTransform(textMatrix))
-                {
-                    IBrush brush = PlatformUtils.IsOSX
-                        ? Brushes.Black
-                        : new SolidColorBrush(Settings.Data.AccentColor);
-                    ctx.DrawGeometry(brush, new Pen(Brushes.Transparent, 0), textGeometry);
-                }
+                    ctx.DrawText(text.Formatted, origin);
             }
         }
 
         return new WindowIcon(render);
     }
 
-    private static Bitmap MakeDefaultBitmap()
+    private static double Lerp(double from, double to, double t) => from + (to - from) * t;
+
+    /// <summary>
+    /// Rounds up to a whole number of layout points. AppKit derives the status item width from the
+    /// bitmap aspect ratio, so fractional pixel widths would make the content shift around.
+    /// </summary>
+    private static int SnapWidth(double pixels, double scale) =>
+        (int)(Math.Max(1, Math.Ceiling(pixels / scale)) * scale);
+
+    private static TrayText BuildText(string text, double inkHeight, IBrush brush)
     {
-        // OSX uses templated icons
-        var type = PlatformUtils.IsOSX ? "black" : PlatformUtils.IsWindows ? "white_outlined_single" : "white_outlined_multi";
-        var uri = $"{Program.AvaresUrl}/Resources/icon_{type}_tray.ico";
-        return new Bitmap(AssetLoader.Open(new Uri(uri)));
+        // Font metrics give the em box, not the glyph ink box, so probe once and scale from there
+        var probe = Measure(text, 100, brush);
+        var fontSize = probe.Ink.Height > 0 ? 100 * inkHeight / probe.Ink.Height : inkHeight;
+        return Measure(text, fontSize, brush);
+    }
+
+    private static TrayText Measure(string text, double fontSize, IBrush brush)
+    {
+        var formatted = new FormattedText(text, CultureInfo.CurrentCulture, FlowDirection.LeftToRight,
+            new Typeface(FontFamily.Default, FontStyle.Normal, FontWeight.Medium), fontSize, brush);
+        return new TrayText(formatted, formatted.BuildGeometry(new Point(0, 0))?.Bounds ?? default);
+    }
+
+    /// <summary>Laid out percentage text plus the bounds of the glyph ink relative to its origin.</summary>
+    private readonly record struct TrayText(FormattedText Formatted, Rect Ink);
+
+    /// <summary>Tray bitmap together with the bounds of its non-transparent artwork.</summary>
+    private sealed record TrayArtwork(Bitmap Bitmap, Rect Ink)
+    {
+        public double Aspect { get; } = Ink.Width / Ink.Height;
+
+        public static TrayArtwork Load()
+        {
+            // OSX uses templated icons
+            var type = PlatformUtils.IsOSX ? "black" :
+                PlatformUtils.IsWindows ? "white_outlined_single" : "white_outlined_multi";
+            var uri = $"{Program.AvaresUrl}/Resources/icon_{type}_tray.ico";
+            var bitmap = new Bitmap(AssetLoader.Open(new Uri(uri)));
+            return new TrayArtwork(bitmap, MeasureInk(bitmap));
+        }
+
+        /// <summary>
+        /// The tray assets pad their artwork to a square, which would leave the earbuds far smaller
+        /// than the surrounding menu bar glyphs once the whole bitmap is fitted to the bar height.
+        /// </summary>
+        private static Rect MeasureInk(Bitmap bitmap)
+        {
+            var size = bitmap.PixelSize;
+            var stride = size.Width * 4;
+            var buffer = Marshal.AllocHGlobal(stride * size.Height);
+            try
+            {
+                bitmap.CopyPixels(new PixelRect(size), buffer, stride * size.Height, stride);
+
+                int left = size.Width, top = size.Height, right = -1, bottom = -1;
+                for (var y = 0; y < size.Height; y++)
+                {
+                    for (var x = 0; x < size.Width; x++)
+                    {
+                        if (Marshal.ReadByte(buffer, y * stride + x * 4 + 3) <= 8)
+                            continue;
+                        left = Math.Min(left, x);
+                        top = Math.Min(top, y);
+                        right = Math.Max(right, x);
+                        bottom = Math.Max(bottom, y);
+                    }
+                }
+
+                if (right >= left && bottom >= top)
+                    return new Rect(left, top, right - left + 1, bottom - top + 1);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "WindowIconRenderer: cannot measure tray artwork bounds");
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+
+            return new Rect(size.ToSize(1));
+        }
     }
 }
