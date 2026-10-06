@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,6 +13,7 @@ namespace GalaxyBudsClient.Platform.OSX
     {
         private static readonly SemaphoreSlim ConnSemaphore = new(1, 1);
         private static readonly SemaphoreSlim SearchSemaphore = new(1, 1);
+        private static readonly SemaphoreSlim SendSemaphore = new(1, 1);
 
         private string _currentMac = string.Empty;
         private string _currentUuid = string.Empty;
@@ -91,7 +93,17 @@ namespace GalaxyBudsClient.Platform.OSX
             Console.WriteLine("OSX.BluetoothService: Channel closed. Disconnected.");
             Disconnected?.Invoke(this, "Device lost connection");
         }
-        
+
+        private static string NativeUtf8ToString(IntPtr ptr)
+        {
+            return ptr == IntPtr.Zero ? string.Empty : Marshal.PtrToStringUTF8(ptr) ?? string.Empty;
+        }
+
+        private static string NativeUtf8ToMacAddress(IntPtr ptr)
+        {
+            return NativeUtf8ToString(ptr).Replace("-", ":");
+        }
+
         public bool IsStreamConnected
         {
             get
@@ -129,8 +141,8 @@ namespace GalaxyBudsClient.Platform.OSX
                         {
                             Device* d = &rawDevices[i];
                             devices[i] = new BluetoothDevice(
-                                Marshal.PtrToStringUTF8(d->device_name) ?? String.Empty,
-                                (Marshal.PtrToStringUTF8(d->mac_address) ?? String.Empty).Replace("-", ":"),
+                                NativeUtf8ToString(d->device_name),
+                                NativeUtf8ToMacAddress(d->mac_address),
                                 d->is_connected,
                                 d->is_paired,
                                 new BluetoothCoD(d->cod),
@@ -154,7 +166,8 @@ namespace GalaxyBudsClient.Platform.OSX
                     throw new BluetoothException(BluetoothException.ErrorCodes.Unknown, "Search failed.");
                 }
 
-                return devices;
+                // IOBluetooth may list the same paired device more than once
+                return devices.DistinctBy(d => d.Address).ToArray();
             } finally
             {
                 SearchSemaphore.Release();
@@ -163,8 +176,7 @@ namespace GalaxyBudsClient.Platform.OSX
 
         private void OnDisconnected(IntPtr mac)
         {
-            var macAddr = Marshal.PtrToStringAnsi(mac) ?? string.Empty;
-            macAddr = macAddr.Replace("-", ":");
+            var macAddr = NativeUtf8ToMacAddress(mac);
             if (string.Equals(macAddr, _currentMac, StringComparison.CurrentCultureIgnoreCase))
             {
                 Disconnected?.Invoke(this, "Device was disconnected");
@@ -178,15 +190,27 @@ namespace GalaxyBudsClient.Platform.OSX
 
         private void OnConnected(IntPtr mac, IntPtr name)
         {
-            var macAddr = Marshal.PtrToStringAnsi(mac) ?? string.Empty;
-            macAddr = macAddr.Replace("-", ":");
-            var shouldReconnect = Volatile.Read(ref _connectInFlight) == 0
-                                  && Volatile.Read(ref _autoReconnectPending) == 0
-                                  && ConnSemaphore.CurrentCount == 1
-                                  && !string.IsNullOrEmpty(_currentMac)
-                                  && !string.IsNullOrEmpty(_currentUuid)
-                                  && string.Equals(macAddr, _currentMac, StringComparison.CurrentCultureIgnoreCase)
-                                  && !IsStreamConnected;
+            if (ConnSemaphore.CurrentCount == 1)
+            {
+                var reconnect = new Action(async () =>
+                {
+                    try
+                    {
+                        await ConnectAsync(_currentMac, _currentUuid, CancellationToken.None);
+                    }
+                    catch (BluetoothException ex)
+                    {
+                        BluetoothErrorAsync?.Invoke(this, ex);
+                    }
+                });
+
+                var macAddr = NativeUtf8ToMacAddress(mac);
+                if (string.Equals(macAddr, _currentMac, StringComparison.CurrentCultureIgnoreCase))
+                {
+                    Log.Debug("OSX.BluetoothService: Reconnecting to {MacAddr}", macAddr);
+                    reconnect();
+                }
+            }
 
             unsafe
             {
@@ -428,12 +452,22 @@ namespace GalaxyBudsClient.Platform.OSX
         public async Task SendAsync(byte[] data)
         {
             BT_SEND_RESULT result;
-            unsafe
+            // Serialize sends: concurrent bt_send calls interleave their MTU-sized
+            // chunks in the RFCOMM stream, corrupting frame boundaries
+            await SendSemaphore.WaitAsync();
+            try
             {
-                fixed (byte* raw = data)
+                unsafe
                 {
-                    result = Bluetooth.bt_send(_nativePtr, raw, (uint)data.Length);
+                    fixed (byte* raw = data)
+                    {
+                        result = Bluetooth.bt_send(_nativePtr, raw, (uint)data.Length);
+                    }
                 }
+            }
+            finally
+            {
+                SendSemaphore.Release();
             }
 
             if (result != BT_SEND_RESULT.BT_SEND_SUCCESS)

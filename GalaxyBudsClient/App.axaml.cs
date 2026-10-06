@@ -1,4 +1,4 @@
-#if OSX
+#if OSX && MACOS_SDK
 using AppKit;
 #endif
 using System;
@@ -68,7 +68,9 @@ public class App : Application
         DataContext = this;
             
 #if OSX
+#if MACOS_SDK
         NSApplication.Init();
+#endif
         // For menu bar applications (LSUIElement=true), hide the dock icon immediately at startup.
         // The dock icon will only appear when the settings window is explicitly opened.
         GalaxyBudsClient.Platform.OSX.AppUtils.setHideInDock(true);
@@ -96,22 +98,42 @@ public class App : Application
     
     public override void OnFrameworkInitializationCompleted()
     {
+        // FluentAvalonia 2.4.1's ItemsRepeaterAutomationPeer.GetChildrenCore() can throw an
+        // unguarded NullReferenceException when the macOS accessibility bridge walks the automation
+        // tree while a repeater is mid-virtualization (e.g. during a navigation/relayout triggered
+        // by changing a setting). Upstream never guarded this, and the exception otherwise
+        // propagates out of the dispatcher loop and kills the whole app. Swallow only that specific
+        // accessibility-tree failure — it is benign and affects an assistive-technology query, not
+        // the UI itself — while letting every other exception crash and report as before.
+        Dispatcher.UIThread.UnhandledException += OnDispatcherUnhandledException;
+        /* Must subscribe before the initial connection attempt to catch its Connected event */
+        MultipointPatcher.Init();
+
         if (BluetoothImpl.HasValidDevice)
         {
             Task.Run(() => BluetoothImpl.Instance.ConnectAsync());
             _ = TrayManager.Instance.RebuildAsync();
         }
         
+        // Subscribe BEFORE MainWindow (and its page viewmodels) is constructed: handlers fire in
+        // subscription order, and EqualizerPageViewModel's ESU handler persists CustomEqualizerEnabled.
+        // Our one-shot ReapplyCustomEqualizerAsync must read that flag before the VM can overwrite it,
+        // or a post-power-cycle ESU reporting a non-custom mode would silently kill the re-push.
+        SppMessageReceiver.Instance.ExtendedStatusUpdate += OnExtendedStatusUpdate;
+
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             // Initialize MainWindow singleton
             var mainWindow = MainWindow.Instance;
             
 #if OSX
-            // On macOS with LSUIElement=true, always start as a menu bar app (no main window attached initially)
-            // The window will be shown when the user clicks the tray icon
-            desktop.MainWindow = null;
-            mainWindow.IsVisible = false;
+            // Show the main window on launch (unless started with /StartMinimized); the menu bar
+            // icon stays available either way. When we show it, restore the dock icon that
+            // Initialize() hid for the menu-bar-app case.
+            desktop.MainWindow = StartMinimized ? null : mainWindow;
+            mainWindow.IsVisible = !StartMinimized;
+            if (!StartMinimized)
+                GalaxyBudsClient.Platform.OSX.AppUtils.setHideInDock(false);
 #else
             // Stay initially minimized: don't attach a main window
             desktop.MainWindow = StartMinimized ? null : mainWindow;
@@ -134,8 +156,9 @@ public class App : Application
         BluetoothImpl.Instance.Connecting += OnConnecting;
         SppMessageReceiver.Instance.StatusUpdate += OnStatusUpdate;
         SppMessageReceiver.Instance.OtherOption += HandleOtherTouchOption;
-        SppMessageReceiver.Instance.ExtendedStatusUpdate += OnExtendedStatusUpdate;
-        
+        // ExtendedStatusUpdate subscribed earlier (before MainWindow) — see comment there
+        SppMessageReceiver.Instance.NoiseControlUpdateResponse += OnNoiseControlUpdate;
+
         DeviceMessageCache.Init();
         
         if (Loc.IsTranslatorModeEnabled)
@@ -167,103 +190,26 @@ public class App : Application
     
     private void ShowPopup(BudsPopupMode mode = BudsPopupMode.Battery, bool noDebounce = false)
     {
-        _ = ShowPopupAsync(mode, noDebounce);
-    }
-
-    private async Task ShowPopupAsync(BudsPopupMode mode = BudsPopupMode.Battery, bool noDebounce = false)
-    {
-        if (!PlatformUtils.IsDesktop)
+        if (!PlatformUtils.IsDesktop || (_popupShown && !noDebounce))
             return;
-
-        // Coalesce rapid Connecting events (retries / double baseband callbacks).
-        _popupShowCts?.Cancel();
-        _popupShowCts?.Dispose();
-        _popupShowCts = new CancellationTokenSource();
-        var token = _popupShowCts.Token;
-
-        try
+        
+        if (_popup is { IsVisible: true })
         {
-            if (token.IsCancellationRequested)
-                return;
-
-            await Dispatcher.UIThread.InvokeAsync(async () =>
-            {
-                if (token.IsCancellationRequested)
-                    return;
-
-                if (_popupShown && !noDebounce && mode == BudsPopupMode.Battery)
-                    return;
-
-                if (_popup is { IsPresented: true } && _popup.Mode == mode)
-                {
-                    if (mode == BudsPopupMode.Battery)
-                        _popup.RearmTimer();
-                    _popupShown = true;
-                    return;
-                }
-
-                if (_popup is { IsPresented: true })
-                {
-                    _popup.SetMode(mode);
-                    if (mode == BudsPopupMode.Battery)
-                        _popup.RearmTimer();
-                    _popupShown = true;
-                    return;
-                }
-
-                EnsurePopupInstance();
-                _popup!.SetMode(mode);
-                _popupShown = true;
-                await _popup.ShowAnimatedAsync().ConfigureAwait(true);
-            }, DispatcherPriority.Normal).ConfigureAwait(true);
+            _popup.UpdateSettings();
+            _popup.RearmTimer();
+            return;
         }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (InvalidOperationException)
-        {
-            // Window was closed externally — recreate once.
-            _popup = new BudsPopup();
-            _popup.SetMode(mode);
-            _popupShown = true;
-            await _popup.ShowAnimatedAsync().ConfigureAwait(true);
-        }
-    }
-
-    private void EnsurePopupInstance()
-    {
-        _popup ??= new BudsPopup();
-    }
-
-    private void HidePopup()
-    {
-        _popupShowCts?.Cancel();
-        if (_popup is { IsPresented: true } or { IsVisible: true })
-            _popup.Hide(force: false);
-        _popupShown = false;
-    }
-
-    private void HidePopupImmediate()
-    {
-        _popupShowCts?.Cancel();
-        if (_popup is { IsPresented: true } or { IsVisible: true })
-            _popup.Hide(force: true);
-        _popupShown = false;
-    }
-
-    private void OnConnecting(object? sender, EventArgs e)
-    {
-        // Always surface connecting state on desktop — ACL bounce briefly drops audio
-        // and users need to know the app is still working.
-        _ = ShowPopupAsync(BudsPopupMode.Connecting, noDebounce: true);
+        
+        Dialogs.ShowAsSingleInstanceOnDesktop(ref _popup); 
+        _popupShown = true;
     }
     
+    private bool _customEqReapplied;
+
     private void OnConnected(object? sender, EventArgs e)
     {
-        // Keep connecting popup until battery status arrives (or hide if popup disabled).
-        // Hide respects the minimum connecting dwell so the message stays readable.
-        if (!Settings.Data.PopupEnabled)
-            Dispatcher.UIThread.Post(HidePopup, DispatcherPriority.Background);
+        _popupShown = false;
+        _customEqReapplied = false;
     }
 
     private void OnBluetoothError(object? sender, BluetoothException e)
@@ -275,8 +221,8 @@ public class App : Application
     private void OnDisconnected(object? sender, string e)
     {
         WindowIconRenderer.ResetIconToDefault();
-        // Do not hide here: macOS ACL bounce intentionally disconnects briefly while
-        // Connecting mode is still in progress. Battery mode still auto-hides via timer.
+        _popupShown = false;
+        _customEqReapplied = false;
     }
     
     private void OnExtendedStatusUpdate(object? sender, ExtendedStatusUpdateDecoder e)
@@ -300,8 +246,74 @@ public class App : Application
         _ = BluetoothImpl.Instance.SendAsync(new ManagerInfoEncoder());
         if(BluetoothImpl.Instance.DeviceSpec.Supports(Features.DebugSku))
             _ = BluetoothImpl.Instance.SendRequestAsync(MsgIds.DEBUG_SKU);
+
+        // Re-apply the saved custom EQ ONCE per connection. ExtendedStatusUpdate also arrives on
+        // routine state changes (case open/close, on-head, noise-control switches); re-pushing the
+        // EQ on every one caused an audible mid-session re-application. The firmware drops the
+        // custom table on power-cycle, so a single re-push per connect is enough.
+        if (!_customEqReapplied)
+        {
+            _customEqReapplied = true;
+            _ = ReapplyCustomEqualizerAsync();
+        }
     }
-    
+
+    // The firmware drops the custom EQ band table on every noise-control switch (ANC/Ambient/Off),
+    // not just on power-cycle, so re-push it whenever the buds report a mode change. Listening to the
+    // dedicated NoiseControlUpdate signal avoids the case-open/on-head/battery churn that re-pushing
+    // on every ExtendedStatusUpdate caused.
+    private void OnNoiseControlUpdate(object? sender, NoiseControlModes e)
+    {
+        // Table-drop on NC switch only observed on Buds4 Pro; don't override phone-side
+        // EQ choices on other CustomEqualizer models where the table survives the switch.
+        if (BluetoothImpl.Instance.CurrentModel == Models.Buds4Pro)
+            _ = ReapplyCustomEqualizerAsync();
+    }
+
+    // The custom EQ band table is not retained by the firmware across power cycles, so the values
+    // are persisted per-device (see EqualizerPageViewModel.PersistCustomEq) and re-pushed here on
+    // every connect, mirroring what the official Galaxy Wearable app does.
+    private static async Task ReapplyCustomEqualizerAsync()
+    {
+        if (!BluetoothImpl.Instance.DeviceSpec.Supports(Features.CustomEqualizer))
+            return;
+        if (BluetoothImpl.Instance.Device.Current is not { CustomEqualizerEnabled: true } device ||
+            device.CustomEqualizerBands is not { Length: 9 } bands)
+            return;
+
+        await BluetoothImpl.Instance.SendAsync(new SetCustomEqualizerEncoder
+        {
+            BandGains =
+            [
+                (sbyte)bands[0], (sbyte)bands[1], (sbyte)bands[2],
+                (sbyte)bands[3], (sbyte)bands[4], (sbyte)bands[5],
+                (sbyte)bands[6], (sbyte)bands[7], (sbyte)bands[8]
+            ]
+        });
+        // Samsung preset index 6 = custom; the EQUALIZER message carries index + 1 (7)
+        await BluetoothImpl.Instance.SendAsync(new SetEqualizerEncoder { IsEnabled = true, Preset = 6 });
+    }
+
+    private static void OnDispatcherUnhandledException(object? sender, DispatcherUnhandledExceptionEventArgs e)
+    {
+        // Swallow ONLY FluentAvalonia's ItemsRepeaterAutomationPeer.GetChildrenCore() NRE, raised by
+        // the macOS accessibility bridge while walking the automation tree. Match precisely (specific
+        // type + method, unwrapping inner/aggregate exceptions) so genuine bugs still crash/report.
+        for (Exception? ex = e.Exception; ex != null; ex = ex.InnerException)
+        {
+            if (ex is NullReferenceException &&
+                ex.StackTrace is { } trace &&
+                trace.Contains("ItemsRepeaterAutomationPeer") &&
+                trace.Contains("GetChildrenCore"))
+            {
+                Log.Warning(e.Exception,
+                    "Suppressed non-fatal automation-peer exception raised by the accessibility bridge");
+                e.Handled = true;
+                return;
+            }
+        }
+    }
+
     private void OnStatusUpdate(object? sender, StatusUpdateDecoder e)
     {
         if (_lastWearState == LegacyWearStates.None &&
